@@ -1,0 +1,31 @@
+{
+    "model_name": "MobileNetV2",
+    "saved_model": "/Users/liuliwei/PycharmProjects/TrashNetMobileNetV2VsCnn/models/20260602_210747/MobileNetV2.pth",
+    "metrics": {
+        "accuracy": 0.9578947368421052,
+        "precision": 0.9602122015915119,
+        "recall": 0.9972451790633609,
+        "f1_score": 0.9783783783783784,
+        "confusion_matrix": [
+            [
+                2,
+                15
+            ],
+            [
+                1,
+                362
+            ]
+        ]
+    },
+    "class_to_idx": {
+        "garbage": 0,
+        "non_garbage": 1
+    },
+    "params": {
+        "epochs": 10,
+        "batch_size": 64,
+        "learning_rate": 0.001,
+        "image_size": 224,
+        "device": "mps"
+    }
+}
