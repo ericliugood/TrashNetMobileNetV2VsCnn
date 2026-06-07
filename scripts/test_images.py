@@ -17,13 +17,13 @@ from PIL import Image
 project_root = Path(__file__).resolve().parent.parent
 
 # 改成你自己的模型資料夾時間戳
-MODEL_PATH = project_root / "models" / "20260607_115102" / "MobileNetV2.pth"
+MODEL_PATH = project_root / "models" / "20260607_215558" / "MobileNetV2.pth"
 
 # 可選：mobilenetv2 或 cnn
 MODEL_TYPE = "mobilenetv2"
 
 # 放你要測試的圖片
-IMAGE_PATH = project_root / "test_images" / "img_1.png"
+IMAGE_PATH = project_root / "test_images" / "img_3.png"
 
 IMAGE_SIZE = 224
 
