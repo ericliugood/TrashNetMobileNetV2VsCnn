@@ -1,0 +1,52 @@
+{
+    "model_name": "CNN",
+    "saved_model": "/Users/liuliwei/PycharmProjects/TrashNetMobileNetV2VsCnn/models/20260607_115102/CNN.pth",
+    "metrics": {
+        "accuracy": 0.8447368421052631,
+        "garbage_precision": 0.20588235294117646,
+        "garbage_recall": 0.7368421052631579,
+        "garbage_f1_score": 0.3218390804597701,
+        "non_garbage_precision": 0.9839743589743589,
+        "non_garbage_recall": 0.850415512465374,
+        "non_garbage_f1_score": 0.912332838038633,
+        "macro_precision": 0.5949283559577677,
+        "macro_recall": 0.7936288088642659,
+        "macro_f1_score": 0.6170859592492015,
+        "confusion_matrix": [
+            [
+                14,
+                5
+            ],
+            [
+                54,
+                307
+            ]
+        ],
+        "classification_report": "              precision    recall  f1-score   support\n\n     garbage       0.21      0.74      0.32        19\n non_garbage       0.98      0.85      0.91       361\n\n    accuracy                           0.84       380\n   macro avg       0.59      0.79      0.62       380\nweighted avg       0.95      0.84      0.88       380\n"
+    },
+    "params": {
+        "epochs": 10,
+        "batch_size": 64,
+        "learning_rate": 0.0001,
+        "image_size": 224,
+        "random_seed": 42,
+        "device": "mps",
+        "class_to_idx": {
+            "garbage": 0,
+            "non_garbage": 1
+        },
+        "class_counts": [
+            100,
+            1668
+        ],
+        "original_class_weights": [
+            2.973213749463701,
+            0.7279945186501422
+        ],
+        "garbage_weight": 4.459820624195552,
+        "non_garbage_weight": 0.7279945186501422,
+        "focal_gamma": 2.0,
+        "garbage_penalty_multiplier": 1.5,
+        "loss_function": "Focal Loss + Class Weight + Garbage Penalty"
+    }
+}
