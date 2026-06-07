@@ -1,9 +1,10 @@
 # step2.py
 # 功能：
-# 1. 使用 PyTorch 讀取 train / val / test 圖片資料
-# 2. 訓練 MobileNetV2 與自建 CNN
-# 3. 比較 Accuracy / Precision / Recall / F1-score / Confusion Matrix
-# 4. 儲存模型版本與實驗結果
+# 1. 使用 PyTorch 訓練 MobileNetV2 與 CNN
+# 2. 使用 Focal Loss + Class Weight + Garbage Penalty 處理類別不平衡
+# 3. MobileNetV2 與 CNN 使用不同 learning rate
+# 4. 評估 Accuracy、Precision、Recall、F1-score、Macro F1、Confusion Matrix
+# 5. 儲存模型版本與實驗結果
 
 from pathlib import Path
 from datetime import datetime
@@ -32,9 +33,7 @@ from sklearn.metrics import (
 # 1. 設定路徑與裝置
 # =========================
 
-# 假設 step2.py 放在 scripts/ 裡面
 project_root = Path(__file__).resolve().parent.parent
-
 base_path = project_root / "trashnet" / "trashnew"
 
 print("project_root =", project_root)
@@ -43,7 +42,6 @@ print("base_path =", base_path)
 if not base_path.exists():
     raise FileNotFoundError(f"找不到資料夾：{base_path}")
 
-# Mac M 系列使用 mps，其他使用 cpu
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 print("device =", device)
 
@@ -54,10 +52,26 @@ print("device =", device)
 
 EPOCHS = 10
 BATCH_SIZE = 64
-LEARNING_RATE = 0.001
 IMAGE_SIZE = 224
+RANDOM_SEED = 42
 
-# 每次執行建立一個模型版本資料夾
+# MobileNetV2：只訓練最後分類層，learning rate 可以較大
+MOBILENET_LR = 0.001
+
+# CNN：從零開始訓練，learning rate 建議較小
+CNN_LR = 0.0001
+
+# Focal Loss 參數
+# gamma 越大，越重視難分樣本與答錯樣本
+FOCAL_GAMMA = 2.0
+
+# 額外提高 garbage 類別的錯誤懲罰
+# 如果模型還是完全抓不到 garbage，可以提高到 2.0
+# 如果模型過度預測 garbage，可以降低到 1.2
+GARBAGE_PENALTY_MULTIPLIER = 1.5
+
+torch.manual_seed(RANDOM_SEED)
+
 RUN_TIME = datetime.now().strftime("%Y%m%d_%H%M%S")
 MODEL_DIR = project_root / "models" / RUN_TIME
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -69,7 +83,6 @@ print("MODEL_DIR =", MODEL_DIR)
 # 3. 建立 transforms
 # =========================
 
-# train：有資料增強
 train_transform = transforms.Compose([
     transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
     transforms.RandomRotation(20),
@@ -78,7 +91,6 @@ train_transform = transforms.Compose([
     transforms.ToTensor()
 ])
 
-# val / test：不做資料增強
 test_transform = transforms.Compose([
     transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
     transforms.ToTensor()
@@ -122,6 +134,7 @@ test_loader = DataLoader(
     shuffle=False
 )
 
+print("\n===== Dataset Info =====")
 print("classes =", train_dataset.classes)
 print("class_to_idx =", train_dataset.class_to_idx)
 print("train size =", len(train_dataset))
@@ -130,7 +143,45 @@ print("test size =", len(test_dataset))
 
 
 # =========================
-# 5. 建立 MobileNetV2 模型
+# 5. 計算 class weight
+# =========================
+
+class_counts = [0] * len(train_dataset.classes)
+
+for _, label in train_dataset.samples:
+    class_counts[label] += 1
+
+total_samples = sum(class_counts)
+
+# 原始 class weight：
+# total_samples / (num_classes * class_count)
+#
+# 這裡使用平方根版本，避免少數類別權重過大造成訓練震盪
+class_weights = [
+    (total_samples / (len(class_counts) * count)) ** 0.5
+    for count in class_counts
+]
+
+GARBAGE_IDX = train_dataset.class_to_idx["garbage"]
+NON_GARBAGE_IDX = train_dataset.class_to_idx["non_garbage"]
+
+# 額外提高 garbage 類別懲罰
+GARBAGE_WEIGHT = class_weights[GARBAGE_IDX] * GARBAGE_PENALTY_MULTIPLIER
+NON_GARBAGE_WEIGHT = class_weights[NON_GARBAGE_IDX]
+
+print("\n===== Class Weight Info =====")
+print("class_counts =", class_counts)
+print("original_class_weights =", class_weights)
+print("GARBAGE_IDX =", GARBAGE_IDX)
+print("NON_GARBAGE_IDX =", NON_GARBAGE_IDX)
+print("GARBAGE_WEIGHT =", GARBAGE_WEIGHT)
+print("NON_GARBAGE_WEIGHT =", NON_GARBAGE_WEIGHT)
+print("FOCAL_GAMMA =", FOCAL_GAMMA)
+print("GARBAGE_PENALTY_MULTIPLIER =", GARBAGE_PENALTY_MULTIPLIER)
+
+
+# =========================
+# 6. 建立 MobileNetV2
 # =========================
 
 def build_mobilenetv2():
@@ -138,11 +189,11 @@ def build_mobilenetv2():
         weights=models.MobileNet_V2_Weights.IMAGENET1K_V1
     )
 
-    # 凍結特徵提取層
+    # 凍結特徵提取層，只訓練最後分類層
     for param in model.features.parameters():
         param.requires_grad = False
 
-    # 修改分類層為二分類
+    # 改成二分類輸出
     model.classifier = nn.Sequential(
         nn.Dropout(0.3),
         nn.Linear(model.last_channel, 1)
@@ -152,7 +203,7 @@ def build_mobilenetv2():
 
 
 # =========================
-# 6. 建立自建 CNN 模型
+# 7. 建立 CNN
 # =========================
 
 class SimpleCNN(nn.Module):
@@ -160,25 +211,28 @@ class SimpleCNN(nn.Module):
         super(SimpleCNN, self).__init__()
 
         self.features = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=3),
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.MaxPool2d(2, 2),
 
-            nn.Conv2d(64, 128, kernel_size=3),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.MaxPool2d(2, 2),
 
-            nn.Conv2d(128, 256, kernel_size=3),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
             nn.ReLU(),
-            nn.MaxPool2d(2, 2)
+            nn.MaxPool2d(2, 2),
+
+            nn.AdaptiveAvgPool2d((1, 1))
         )
 
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(256 * 26 * 26, 256),
-            nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(256, 1)
+            nn.Linear(128, 1)
         )
 
     def forward(self, x):
@@ -188,13 +242,58 @@ class SimpleCNN(nn.Module):
 
 
 # =========================
-# 7. 訓練函式
+# 8. Focal Loss + Class Weight
+# =========================
+
+def focal_loss(outputs, labels):
+    """
+    outputs: model raw logits, shape [batch_size, 1]
+    labels : 0 or 1, shape [batch_size, 1]
+
+    功能：
+    1. BCEWithLogitsLoss：基本二分類 loss
+    2. Focal factor：提高難分與答錯樣本懲罰
+    3. Class weight：提高 garbage 類別懲罰
+    """
+
+    bce_loss = nn.functional.binary_cross_entropy_with_logits(
+        outputs,
+        labels,
+        reduction="none"
+    )
+
+    probs = torch.sigmoid(outputs)
+
+    # p_t 是模型對正確類別的信心
+    # label = 1 時，p_t = probs
+    # label = 0 時，p_t = 1 - probs
+    p_t = torch.where(
+        labels == 1,
+        probs,
+        1 - probs
+    )
+
+    # Focal Loss：答得越差，p_t 越小，懲罰越大
+    focal_factor = (1 - p_t) ** FOCAL_GAMMA
+
+    # Class Weight：garbage 類別給更大權重
+    sample_weights = torch.where(
+        labels == GARBAGE_IDX,
+        torch.tensor(GARBAGE_WEIGHT, device=device),
+        torch.tensor(NON_GARBAGE_WEIGHT, device=device)
+    )
+
+    loss = bce_loss * focal_factor * sample_weights
+
+    return loss.mean()
+
+
+# =========================
+# 9. 訓練函式
 # =========================
 
 def train_model(model, train_loader, val_loader, epochs, learning_rate, model_name):
     model = model.to(device)
-
-    criterion = nn.BCEWithLogitsLoss()
 
     optimizer = optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()),
@@ -223,7 +322,7 @@ def train_model(model, train_loader, val_loader, epochs, learning_rate, model_na
             optimizer.zero_grad()
 
             outputs = model(images)
-            loss = criterion(outputs, labels)
+            loss = focal_loss(outputs, labels)
 
             loss.backward()
             optimizer.step()
@@ -252,7 +351,7 @@ def train_model(model, train_loader, val_loader, epochs, learning_rate, model_na
                 labels = labels.float().unsqueeze(1).to(device)
 
                 outputs = model(images)
-                loss = criterion(outputs, labels)
+                loss = focal_loss(outputs, labels)
 
                 val_loss += loss.item() * images.size(0)
 
@@ -283,7 +382,7 @@ def train_model(model, train_loader, val_loader, epochs, learning_rate, model_na
 
 
 # =========================
-# 8. 評估函式
+# 10. 評估函式
 # =========================
 
 def evaluate_model(model, test_loader, model_name):
@@ -305,42 +404,119 @@ def evaluate_model(model, test_loader, model_name):
             all_labels.extend(labels.numpy())
 
     acc = accuracy_score(all_labels, all_preds)
-    precision = precision_score(all_labels, all_preds, zero_division=0)
-    recall = recall_score(all_labels, all_preds, zero_division=0)
-    f1 = f1_score(all_labels, all_preds, zero_division=0)
+
+    precision_non_garbage = precision_score(
+        all_labels,
+        all_preds,
+        pos_label=NON_GARBAGE_IDX,
+        zero_division=0
+    )
+
+    recall_non_garbage = recall_score(
+        all_labels,
+        all_preds,
+        pos_label=NON_GARBAGE_IDX,
+        zero_division=0
+    )
+
+    f1_non_garbage = f1_score(
+        all_labels,
+        all_preds,
+        pos_label=NON_GARBAGE_IDX,
+        zero_division=0
+    )
+
+    precision_garbage = precision_score(
+        all_labels,
+        all_preds,
+        pos_label=GARBAGE_IDX,
+        zero_division=0
+    )
+
+    recall_garbage = recall_score(
+        all_labels,
+        all_preds,
+        pos_label=GARBAGE_IDX,
+        zero_division=0
+    )
+
+    f1_garbage = f1_score(
+        all_labels,
+        all_preds,
+        pos_label=GARBAGE_IDX,
+        zero_division=0
+    )
+
+    macro_precision = precision_score(
+        all_labels,
+        all_preds,
+        average="macro",
+        zero_division=0
+    )
+
+    macro_recall = recall_score(
+        all_labels,
+        all_preds,
+        average="macro",
+        zero_division=0
+    )
+
+    macro_f1 = f1_score(
+        all_labels,
+        all_preds,
+        average="macro",
+        zero_division=0
+    )
+
     cm = confusion_matrix(all_labels, all_preds)
 
     print(f"\n===== {model_name} Test Evaluation =====")
-    print(f"Accuracy : {acc:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall   : {recall:.4f}")
-    print(f"F1-score : {f1:.4f}")
+    print(f"Accuracy              : {acc:.4f}")
+    print(f"Garbage Precision     : {precision_garbage:.4f}")
+    print(f"Garbage Recall        : {recall_garbage:.4f}")
+    print(f"Garbage F1-score      : {f1_garbage:.4f}")
+    print(f"Non-garbage Precision : {precision_non_garbage:.4f}")
+    print(f"Non-garbage Recall    : {recall_non_garbage:.4f}")
+    print(f"Non-garbage F1-score  : {f1_non_garbage:.4f}")
+    print(f"Macro Precision       : {macro_precision:.4f}")
+    print(f"Macro Recall          : {macro_recall:.4f}")
+    print(f"Macro F1-score        : {macro_f1:.4f}")
     print("Confusion Matrix:")
     print(cm)
 
     print("\nClassification Report:")
-    print(
-        classification_report(
-            all_labels,
-            all_preds,
-            target_names=test_dataset.classes,
-            zero_division=0
-        )
+    report = classification_report(
+        all_labels,
+        all_preds,
+        target_names=test_dataset.classes,
+        zero_division=0
     )
+    print(report)
 
     metrics = {
         "accuracy": acc,
-        "precision": precision,
-        "recall": recall,
-        "f1_score": f1,
-        "confusion_matrix": cm.tolist()
+
+        "garbage_precision": precision_garbage,
+        "garbage_recall": recall_garbage,
+        "garbage_f1_score": f1_garbage,
+
+        "non_garbage_precision": precision_non_garbage,
+        "non_garbage_recall": recall_non_garbage,
+        "non_garbage_f1_score": f1_non_garbage,
+
+        "macro_precision": macro_precision,
+        "macro_recall": macro_recall,
+        "macro_f1_score": macro_f1,
+
+        "confusion_matrix": cm.tolist(),
+        "classification_report": report
     }
 
     return metrics
 
 
 # =========================
-# 9. 畫 Accuracy / Loss 圖
+# 11. 畫 Accuracy / Loss
 # =========================
 
 def plot_history(history, title):
@@ -353,6 +529,7 @@ def plot_history(history, title):
     plt.xlabel("Epoch")
     plt.ylabel("Accuracy")
     plt.legend()
+    plt.savefig(MODEL_DIR / f"{title}_accuracy.png")
 
     plt.figure()
     plt.plot(epochs, history["train_loss"], label="Train Loss")
@@ -361,10 +538,11 @@ def plot_history(history, title):
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.legend()
+    plt.savefig(MODEL_DIR / f"{title}_loss.png")
 
 
 # =========================
-# 10. 畫 Confusion Matrix
+# 12. 畫 Confusion Matrix
 # =========================
 
 def plot_confusion_matrix(cm, class_names, title):
@@ -381,44 +559,49 @@ def plot_confusion_matrix(cm, class_names, title):
             plt.text(j, i, cm[i][j], ha="center", va="center")
 
     plt.colorbar()
+    plt.savefig(MODEL_DIR / f"{title}.png")
 
 
 # =========================
-# 11. 儲存模型版本
+# 13. 儲存模型版本
 # =========================
 
-def save_model_version(model, history, metrics, model_name):
+def save_model_version(model, history, metrics, model_name, learning_rate):
     model_path = MODEL_DIR / f"{model_name}.pth"
     info_path = MODEL_DIR / f"{model_name}_info.json"
 
-    save_data = {
-        "model_state_dict": model.state_dict(),
-        "history": history,
-        "metrics": metrics,
+    params = {
+        "epochs": EPOCHS,
+        "batch_size": BATCH_SIZE,
+        "learning_rate": learning_rate,
+        "image_size": IMAGE_SIZE,
+        "random_seed": RANDOM_SEED,
+        "device": str(device),
         "class_to_idx": train_dataset.class_to_idx,
-        "params": {
-            "epochs": EPOCHS,
-            "batch_size": BATCH_SIZE,
-            "learning_rate": LEARNING_RATE,
-            "image_size": IMAGE_SIZE,
-            "device": str(device)
-        }
+        "class_counts": class_counts,
+        "original_class_weights": class_weights,
+        "garbage_weight": GARBAGE_WEIGHT,
+        "non_garbage_weight": NON_GARBAGE_WEIGHT,
+        "focal_gamma": FOCAL_GAMMA,
+        "garbage_penalty_multiplier": GARBAGE_PENALTY_MULTIPLIER,
+        "loss_function": "Focal Loss + Class Weight + Garbage Penalty"
     }
 
-    torch.save(save_data, model_path)
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "history": history,
+            "metrics": metrics,
+            "params": params
+        },
+        model_path
+    )
 
     info = {
         "model_name": model_name,
         "saved_model": str(model_path),
         "metrics": metrics,
-        "class_to_idx": train_dataset.class_to_idx,
-        "params": {
-            "epochs": EPOCHS,
-            "batch_size": BATCH_SIZE,
-            "learning_rate": LEARNING_RATE,
-            "image_size": IMAGE_SIZE,
-            "device": str(device)
-        }
+        "params": params
     }
 
     with open(info_path, "w", encoding="utf-8") as f:
@@ -429,7 +612,7 @@ def save_model_version(model, history, metrics, model_name):
 
 
 # =========================
-# 12. 訓練 MobileNetV2
+# 14. 訓練 MobileNetV2
 # =========================
 
 mobilenet_model = build_mobilenetv2()
@@ -439,7 +622,7 @@ mobilenet_model, mobilenet_history = train_model(
     train_loader=train_loader,
     val_loader=val_loader,
     epochs=EPOCHS,
-    learning_rate=LEARNING_RATE,
+    learning_rate=MOBILENET_LR,
     model_name="MobileNetV2"
 )
 
@@ -454,19 +637,20 @@ mobilenet_metrics = evaluate_model(
 plot_confusion_matrix(
     cm=mobilenet_metrics["confusion_matrix"],
     class_names=test_dataset.classes,
-    title="MobileNetV2 Confusion Matrix"
+    title="MobileNetV2_confusion_matrix"
 )
 
 save_model_version(
     model=mobilenet_model,
     history=mobilenet_history,
     metrics=mobilenet_metrics,
-    model_name="MobileNetV2"
+    model_name="MobileNetV2",
+    learning_rate=MOBILENET_LR
 )
 
 
 # =========================
-# 13. 訓練 CNN
+# 15. 訓練 CNN
 # =========================
 
 cnn_model = SimpleCNN()
@@ -476,7 +660,7 @@ cnn_model, cnn_history = train_model(
     train_loader=train_loader,
     val_loader=val_loader,
     epochs=EPOCHS,
-    learning_rate=LEARNING_RATE,
+    learning_rate=CNN_LR,
     model_name="CNN"
 )
 
@@ -491,33 +675,34 @@ cnn_metrics = evaluate_model(
 plot_confusion_matrix(
     cm=cnn_metrics["confusion_matrix"],
     class_names=test_dataset.classes,
-    title="CNN Confusion Matrix"
+    title="CNN_confusion_matrix"
 )
 
 save_model_version(
     model=cnn_model,
     history=cnn_history,
     metrics=cnn_metrics,
-    model_name="CNN"
+    model_name="CNN",
+    learning_rate=CNN_LR
 )
 
 
 # =========================
-# 14. 比較結果
+# 16. 比較結果
 # =========================
 
 print("\n===== Model Comparison =====")
 
 print("\nMobileNetV2:")
-print(f"Accuracy : {mobilenet_metrics['accuracy']:.4f}")
-print(f"Precision: {mobilenet_metrics['precision']:.4f}")
-print(f"Recall   : {mobilenet_metrics['recall']:.4f}")
-print(f"F1-score : {mobilenet_metrics['f1_score']:.4f}")
+print(f"Accuracy        : {mobilenet_metrics['accuracy']:.4f}")
+print(f"Garbage Recall  : {mobilenet_metrics['garbage_recall']:.4f}")
+print(f"Garbage F1      : {mobilenet_metrics['garbage_f1_score']:.4f}")
+print(f"Macro F1        : {mobilenet_metrics['macro_f1_score']:.4f}")
 
 print("\nCNN:")
-print(f"Accuracy : {cnn_metrics['accuracy']:.4f}")
-print(f"Precision: {cnn_metrics['precision']:.4f}")
-print(f"Recall   : {cnn_metrics['recall']:.4f}")
-print(f"F1-score : {cnn_metrics['f1_score']:.4f}")
+print(f"Accuracy        : {cnn_metrics['accuracy']:.4f}")
+print(f"Garbage Recall  : {cnn_metrics['garbage_recall']:.4f}")
+print(f"Garbage F1      : {cnn_metrics['garbage_f1_score']:.4f}")
+print(f"Macro F1        : {cnn_metrics['macro_f1_score']:.4f}")
 
 plt.show()
